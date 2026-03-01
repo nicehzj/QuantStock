@@ -15,3 +15,4 @@ A high-performance, modular quantitative trading analysis workflow system.
 3. Run the pipeline: `python run_pipeline.py`
 
 Refer to `GEMINI.md` for detailed architecture and development conventions.
+You can download the A stock history daily data from the Release. (2006.01.01-2026.2.28)
