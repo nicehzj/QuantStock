@@ -1,0 +1,11 @@
+baostock
+pandas
+pyarrow
+tqdm
+psycopg2-binary
+duckdb
+redis
+alphalens
+vectorbt
+backtrader
+numpy

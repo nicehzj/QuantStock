@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+quant_stock_env/
+.venv/
+venv/
+ENV/
+
+# Databases & Binaries
+questdb/
+Redis-x64-5.0.14.1/
+qdbroot/
+dump.rdb
+
+# Data (Large files)
+data/daily_k/
+data/index_k/
+data/stock_pools/
+data/sync_metadata.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
