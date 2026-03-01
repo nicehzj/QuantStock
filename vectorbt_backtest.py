@@ -15,7 +15,7 @@ class VBTBacktester:
         # 复用之前的因子引擎获取数据路径
         self.engine = FactorEngine()
         
-    def run_momentum_screening(self, top_n=30, fees=0.0013):
+    def run_momentum_screening(self, top_n=20, fees=0.0013, start_date='2021-01-01', end_date=None):
         """
         全市场动量选股策略快速回测。
         策略逻辑：每日根据 20 日动量因子排序，持有最强的 top_n 只股票，次日全额调仓。
@@ -33,10 +33,23 @@ class VBTBacktester:
         sql = f"SELECT date, code, close FROM read_parquet('{self.engine.parquet_glob}')"
         price_df = self.engine.db.execute(sql).df().pivot(index='date', columns='code', values='close')
         price_df.index = pd.to_datetime(price_df.index)
+        
+        # 3. 日期过滤：切分样本外区间 (Out-of-Sample)
+        if end_date is None:
+            end_date = price_df.index.max()
+        
+        price_df = price_df[(price_df.index >= start_date) & (price_df.index <= end_date)]
+        factors_df['date'] = pd.to_datetime(factors_df['date'])
+        factors_df = factors_df[(factors_df['date'] >= start_date) & (factors_df['date'] <= end_date)]
+
+        if price_df.empty or factors_df.empty:
+            print(f"⚠️ 错误: 在区间 {start_date} -> {end_date} 内没有足够的回测数据。")
+            return None
+
         # 处理缺失值（退市或停牌股票），保持矩阵完整性
         price_df = price_df.ffill()
 
-        # 3. 生成交易信号 (Entries)
+        # 4. 生成交易信号 (Entries)
         print(f">>> 正在根据动量因子生成 Top {top_n} 信号矩阵...")
         # 将因子 DataFrame 转换为与价格矩阵对齐的宽表
         factor_pivot = factors_df.pivot(index='date', columns='code', values='factor_mom_20')

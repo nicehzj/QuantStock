@@ -79,8 +79,10 @@ class FactorEngine:
                 code,
                 close,
                 volume,
-                pctChg
+                pctChg,
+                isST
             FROM {source_from}
+            WHERE isST != '1' -- 核心修复：剔除 ST 股
         ),
         factor_calc AS (
             SELECT 

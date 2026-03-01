@@ -42,7 +42,7 @@ class AlphaEvaluator:
         """
         return self.engine.db.execute(sql).df()
 
-    def run_alphalens_analysis(self, factor_name='factor_mom_20'):
+    def run_alphalens_analysis(self, factor_name='factor_mom_20', start_date='2006-01-01', end_date='2020-12-31'):
         """
         运行 Alphalens 分析。
         它会自动处理因子的分位数切分、收益对齐和 IC 计算。
@@ -53,8 +53,19 @@ class AlphaEvaluator:
         # 2. 提取价格数据（用于计算未来收益）
         prices_raw = self.get_forward_returns()
         
-        # 3. 准备 Alphalens 格式的因子数据 (MultiIndex: [date, asset])
+        # 3. 日期过滤：仅保留样本内数据 (In-Sample)
         factors_df['date'] = pd.to_datetime(factors_df['date'])
+        prices_raw['date'] = pd.to_datetime(prices_raw['date'])
+        
+        factors_df = factors_df[(factors_df['date'] >= start_date) & (factors_df['date'] <= end_date)]
+        # 价格数据需要稍微多一点点，以满足 Alphalens 内部对未来收益计算的对齐（虽然我们在 SQL 里算好了，但 Alphalens 还需要价格矩阵）
+        prices_raw = prices_raw[(prices_raw['date'] >= start_date) & (prices_raw['date'] <= pd.to_datetime(end_date) + pd.Timedelta(days=30))]
+
+        if factors_df.empty:
+            print(f"⚠️ 警告: 指定日期范围 {start_date} -> {end_date} 内没有因子数据。")
+            return None, factors_df
+
+        # 4. 准备 Alphalens 格式的因子数据 (MultiIndex: [date, asset])
         # 确保索引 unique 并排序
         f_series = factors_df.set_index(['date', 'code'])[factor_name].sort_index()
         
@@ -135,15 +146,40 @@ class AlphaEvaluator:
             print(f"   - 信号列表: {signal_key}")
             print(f"   - 因子分值: {scores_key}")
 
+    def export_historical_signals(self, factor_name='factor_mom_20', top_n=20, start_date='2021-01-01', filename='data/historical_signals.csv'):
+        """
+        导出历史选股信号表。
+        用于驱动精细化回测引擎进行全市场模拟。
+        """
+        # 1. 计算因子
+        factors_df = self.engine.calculate_basic_factors()
+        factors_df['date'] = pd.to_datetime(factors_df['date'])
+        
+        # 2. 筛选样本外数据
+        oos_factors = factors_df[factors_df['date'] >= start_date].copy()
+        
+        print(f">>> 正在生成历史选股信号 (Top {top_n})...")
+        
+        # 3. 逐日筛选排名最高的股票
+        # 使用 rank 函数快速处理截面排名
+        oos_factors['rank'] = oos_factors.groupby('date')[factor_name].rank(ascending=False)
+        signals = oos_factors[oos_factors['rank'] <= top_n][['date', 'code', factor_name]]
+        
+        # 4. 保存到本地
+        signals.to_csv(filename, index=False)
+        print(f"✅ 历史信号已导出至: {filename} (共 {len(signals)} 条记录)")
+        return signals
+
 if __name__ == "__main__":
     # 创建评估实例
     evaluator = AlphaEvaluator()
     
-    # 执行评估流程：动量因子评估
+    # 步骤 A: 运行样本内评估 (2006-2020)
     analysis_res, factors_raw = evaluator.run_alphalens_analysis('factor_mom_20')
     
-    # 如果评估通过，将信号持久化到 Redis
+    # 步骤 B: 导出样本外历史信号 (2021-Present), 用于精细回测
+    evaluator.export_historical_signals(top_n=20)
+    
+    # 如果评估通过，将最新信号推送
     if analysis_res is not None:
         evaluator.push_signals_to_redis(factors_raw)
-    else:
-        print("💡 评估数据不足，无法生成有效信号。请检查本地 Parquet 数据是否覆盖了足够长的时间范围。")

@@ -64,6 +64,8 @@
 ## 📝 TODO / 待办事项
 - [x] 实现防幸存者偏差的全局股票池抓取。
 - [x] 优化多进程同步效率与登录 Session 管理。
+- [x] 实现样本外测试 (Out-of-Sample Testing) 机制 (IS: 2006-2018, OOS: 2019-Present)。
+- [ ] 实现基于滚动窗口的因子有效性验证与动态权重分配 (Walk-Forward Analysis)。
 - [ ] 接入分钟级/Tick 级实时行情数据。
 - [ ] 实现基于 Redis Pub/Sub 的实时模拟交易模块。
 - [ ] 增加更多基础 Alpha 因子库。

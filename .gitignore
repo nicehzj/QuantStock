@@ -38,6 +38,7 @@ data/daily_k/
 data/index_k/
 data/stock_pools/
 data/sync_metadata.json
+data/*.csv
 
 # IDEs
 .vscode/
@@ -48,3 +49,6 @@ data/sync_metadata.json
 # OS
 Thumbs.db
 Desktop.ini
+
+# data zip
+*.zip
