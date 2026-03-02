@@ -114,15 +114,14 @@ class BaostockDataManager:
     def get_master_stock_pool(self, start_year=2006):
         """
         核心优化：获取从 2006 年至今每年初在市股票的并集，彻底解决幸存者偏差。
-        增加缓存逻辑：避免重复下载。
         """
         master_pool_file = os.path.join(self.pool_cache_path, "master_pool.json")
         
-        # 1. 尝试直接加载最终的总池 (如果已经存在)
+        # 1. 尝试直接加载最终的总池
         if os.path.exists(master_pool_file):
             with open(master_pool_file, 'r', encoding='utf-8') as f:
                 cached_pool = json.load(f)
-                print(f"✅ 从本地加载全局股票池，共计 {len(cached_pool)} 只股票。")
+                print(f"[OK] 从本地加载全局股票池，共计 {len(cached_pool)} 只股票。")
                 return cached_pool
 
         print(f">>> 正在构建从 {start_year} 年至今的全局股票池...")
@@ -133,7 +132,6 @@ class BaostockDataManager:
         for year in range(start_year, current_year + 1):
             year_cache_file = os.path.join(self.pool_cache_path, f"stock_pool_{year}.json")
             
-            # 2. 检查该年份是否已有本地缓存
             if os.path.exists(year_cache_file):
                 with open(year_cache_file, 'r', encoding='utf-8') as f:
                     year_stocks = json.load(f)
@@ -141,7 +139,6 @@ class BaostockDataManager:
                     print(f"  - {year} 年数据: 已从本地加载 ({len(year_stocks)} 只)")
                     continue
 
-            # 3. 本地无缓存，从 Baostock 获取
             target_date = f"{year}-01-01"
             rs_date = bs.query_trade_dates(start_date=target_date, end_date=f"{year}-01-20")
             df_date = rs_date.get_data()
@@ -152,11 +149,9 @@ class BaostockDataManager:
                     rs = bs.query_all_stock(day=first_day)
                     df = rs.get_data()
                     if not df.empty:
-                        # 过滤逻辑：sz.0-3 开头，sh.6 开头
                         stocks = df[df['code'].str.contains(r'^sz\.[0-3]|^sh\.6')]['code'].tolist()
                         master_pool.update(stocks)
                         
-                        # 保存该年份的缓存
                         with open(year_cache_file, 'w', encoding='utf-8') as f:
                             json.dump(stocks, f, indent=4)
                         print(f"  - {year} 年数据: 已从 Baostock 获取并缓存 ({len(stocks)} 只)")
@@ -164,11 +159,10 @@ class BaostockDataManager:
         bs.logout()
         sorted_pool = sorted(list(master_pool))
         
-        # 4. 保存最终的合并总池
         with open(master_pool_file, 'w', encoding='utf-8') as f:
             json.dump(sorted_pool, f, indent=4)
             
-        print(f"✅ 全局股票池构建完成，共计 {len(sorted_pool)} 只股票 (包含已退市)。")
+        print(f"[OK] 全局股票池构建完成，共计 {len(sorted_pool)} 只股票 (包含已退市)。")
         return sorted_pool
 
     def run_sync(self, codes, is_index=False, max_workers=4):
@@ -192,23 +186,20 @@ class BaostockDataManager:
                         code, max_date = future.result()
                         if max_date: self.metadata[meta_type][code] = max_date
                     except Exception as e:
-                        print(f"\n❌ 任务失败: {e}")
+                        print(f"\n[Error] 任务失败: {e}")
                     pbar.update(1)
         self._save_metadata()
 
 if __name__ == "__main__":
     manager = BaostockDataManager()
     
-    # 1. 指数数据 (固定几只核心指数)
     print("\n--- 步骤 1: 同步核心指数数据 ---")
     target_indexes = ["sh.000001", "sz.399001", "sh.000300", "sz.399006", "sh.000905", "sh.000016"]
     manager.run_sync(target_indexes, is_index=True, max_workers=2)
     
-    # 2. 全量股票池同步 (自动规避幸存者偏差)
     print("\n--- 步骤 2: 同步全局股票池 (2006-至今) ---")
-    # 为了测试，我们先取全局池的前 40 只进行同步，你可以改为 all_stocks 全量运行
     all_stocks = manager.get_master_stock_pool(start_year=2006)
     if all_stocks:
         manager.run_sync(all_stocks, is_index=False, max_workers=8)
     
-    print("\n✅ 所有任务已结束。")
+    print("\n[OK] 所有任务已结束。")

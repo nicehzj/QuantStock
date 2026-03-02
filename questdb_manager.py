@@ -26,7 +26,7 @@ class QuestDBManager:
         使用 SYMBOL 类型优化股票代码存储，使用 WAL 模式增强并发。
         """
         if not self.conn:
-            print("❌ 无法连接到 QuestDB，请检查 8812 端口是否开启。")
+            print("[Error] 无法连接到 QuestDB，请检查 8812 端口是否开启。")
             return
         
         with self.conn.cursor() as cur:
@@ -71,7 +71,7 @@ class QuestDBManager:
                     pctChg DOUBLE
                 ) timestamp(timestamp) PARTITION BY YEAR WAL;
             """)
-            print("✅ 表结构部署成功。")
+            print("[OK] 表结构部署成功。")
 
     def _get_last_sync_timestamp(self, table, code):
         """查询 QuestDB，获取单只股票已入库的最晚时间戳"""
@@ -99,7 +99,7 @@ class QuestDBManager:
             source_dir = task['dir']
             
             if not os.path.exists(source_dir):
-                print(f"⚠️ 路径不存在，跳过: {source_dir}")
+                print(f"[Warning] 路径不存在，跳过: {source_dir}")
                 continue
             
             files = [f for f in os.listdir(source_dir) if f.endswith('.parquet')]
@@ -127,8 +127,6 @@ class QuestDBManager:
     def _execute_batch_insert(self, df, table):
         """
         利用多行插入提高写入效率。
-        在大规模（千万级）写入时，QuestDB 推荐使用 ILP 协议，
-        此处作为日线级别同步，Postgres 批量插入已足够快。
         """
         cols = ",".join(df.columns)
         values_list = df.values.tolist()
@@ -149,7 +147,6 @@ class QuestDBManager:
     def query_example_resampling(self):
         """
         展示 QuestDB 的时序采样 (Resampling) 威力。
-        例如：将日线数据聚合为季度线。
         """
         print("\n>>> QuestDB 威力展示：一键生成季度 K 线 (SAMPLE BY)...")
         sql = """
@@ -180,7 +177,7 @@ if __name__ == "__main__":
     # 步骤 2: 数据从湖（Parquet）入库（QuestDB）
     start_sync = time.time()
     qdb_mgr.sync_parquet_to_questdb()
-    print(f"\n✨ 同步完成，耗时: {time.time() - start_sync:.2f}s")
+    print(f"\n[Done] 同步完成，耗时: {time.time() - start_sync:.2f}s")
     
     # 步骤 3: 运行一个时序分析查询
     qdb_mgr.query_example_resampling()

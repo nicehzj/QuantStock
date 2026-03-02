@@ -43,7 +43,7 @@ class VBTBacktester:
         factors_df = factors_df[(factors_df['date'] >= start_date) & (factors_df['date'] <= end_date)]
 
         if price_df.empty or factors_df.empty:
-            print(f"⚠️ 错误: 在区间 {start_date} -> {end_date} 内没有足够的回测数据。")
+            print(f"[Warning] 错误: 在区间 {start_date} -> {end_date} 内没有足够的回测数据。")
             return None
 
         # 处理缺失值（退市或停牌股票），保持矩阵完整性
@@ -55,45 +55,150 @@ class VBTBacktester:
         factor_pivot = factors_df.pivot(index='date', columns='code', values='factor_mom_20')
         factor_pivot.index = pd.to_datetime(factor_pivot.index)
         
+        # 获取前收盘价用于计算涨跌停限制
+        sql_pre = f"SELECT date, code, preclose FROM read_parquet('{self.engine.parquet_glob}')"
+        preclose_df = self.engine.db.execute(sql_pre).df().pivot(index='date', columns='code', values='preclose')
+        preclose_df.index = pd.to_datetime(preclose_df.index)
+
         # --- 核心修复：强制对齐所有矩阵 ---
-        # 找到两个矩阵共同的日期和股票代码
-        common_index = price_df.index.intersection(factor_pivot.index)
-        common_columns = price_df.columns.intersection(factor_pivot.columns)
+        common_index = price_df.index.intersection(factor_pivot.index).intersection(preclose_df.index)
+        common_columns = price_df.columns.intersection(factor_pivot.columns).intersection(preclose_df.columns)
         
         price_df = price_df.loc[common_index, common_columns]
         factor_pivot = factor_pivot.loc[common_index, common_columns]
+        preclose_df = preclose_df.loc[common_index, common_columns]
         
+        # A 股限制逻辑 1：计算动态涨跌停 Mask
+        limit_ratios = pd.Series(0.099, index=common_columns)
+        limit_ratios[common_columns.str.startswith('sz.30') | common_columns.str.startswith('sh.688')] = 0.199
+        
+        is_limit_up = price_df >= preclose_df * (1 + limit_ratios)
+        is_limit_down = price_df <= preclose_df * (1 - limit_ratios)
+
         # 对每日截面进行排名，筛选前 top_n
-        entries = factor_pivot.rank(axis=1, ascending=False) <= top_n
-        # 调仓逻辑：今日不在 Top N 列表中的股票全部卖出 (Exits)
-        exits = ~entries
+        is_in_top_n = factor_pivot.rank(axis=1, ascending=True, method='first') <= top_n
         
-        # 填充价格矩阵中的 NaN（Vectorbt 要求价格必须连续且无 NaN）
-        price_df = price_df.ffill().bfill()
+        # 生成精准的进入/退出意向 (这是信号日逻辑)
+        raw_entries_sig = is_in_top_n & (~is_in_top_n.shift(1).fillna(False))
+        raw_exits_sig = (~is_in_top_n) & (is_in_top_n.shift(1).fillna(False))
+
+        # 模拟 T+1 转换到执行日
+        exec_entries = raw_entries_sig.shift(1).fillna(False)
+        exec_exits = raw_exits_sig.shift(1).fillna(False)
+
+        # 在执行日应用涨跌停限制
+        entries = exec_entries & (~is_limit_up)
+        exits = exec_exits & (~is_limit_down)
+
+        entries = entries.astype(bool)
+        exits = exits.astype(bool)
+        price_df = price_df.ffill().bfill().astype(float)
         
         # 4. 执行向量化回测
         print(f">>> Vectorbt 引擎正在并行计算收益率曲线 (标的数: {len(common_columns)})...")
-        # cash_sharing=True 是关键：它模拟了一个统一的现金池在多只股票间分配
+        
         portfolio = vbt.Portfolio.from_signals(
             price_df, 
             entries=entries, 
             exits=exits, 
+            size=0.95 / top_n, 
+            size_type='percent',
+            min_size=100,             
+            size_granularity=100,     
             freq='1D',
-            init_cash=100000,
+            init_cash=1000000,        
             fees=fees,
             cash_sharing=True,
-            group_by=True # 将所有结果聚合为一个投资组合
+            call_seq='auto',
+            group_by=True
         )
-        
+
         duration = time.time() - start_time
-        print(f"✅ 全市场回测完成！总耗时: {duration:.2f} 秒")
+        print(f"[OK] 全市场回测完成！总耗时: {duration:.2f} 秒")
+
+        # --- 核心新增：生成统一交易流水日志 ---
+        print(">>> 正在生成全市场统一交易流水日志 (Unified Trade Log)...")
+        os.makedirs('data', exist_ok=True)
         
-        # 5. 打印核心统计指标
+        try:
+            trades_df = pd.DataFrame(portfolio.trades.values)
+        except Exception:
+            trades_df = portfolio.trades.records_df
+        
+        import numpy as np
+        entry_dates, entry_cols = np.where(exec_entries.values) 
+        exit_dates, exit_cols = np.where(exec_exits.values) 
+        
+        unified_records = []
+
+        # 处理买入意向
+        for d_idx, c_idx in zip(entry_dates, entry_cols):
+            date = common_index[d_idx]
+            code = common_columns[c_idx]
+            price = price_df.iloc[d_idx, c_idx]
+            status = "Success"
+            reason = ""
+            size = 0
+            
+            if is_limit_up.iloc[d_idx, c_idx]:
+                status = "Failed"
+                reason = "Limit Up (Blocked)"
+            else:
+                match = trades_df[(trades_df['col'] == c_idx) & (trades_df['entry_idx'] == d_idx)]
+                if not match.empty:
+                    size = match.iloc[0]['size']
+                else:
+                    status = "Failed"
+                    reason = "Insufficient Funds / Lot Size Limit"
+            
+            unified_records.append({
+                'Timestamp': date, 'Code': code, 'Action': 'BUY',
+                'Price': round(price, 3), 'Status': status, 'Reason': reason,
+                'Size': size, 'PnL': 0, 'PnL_Pct': 0
+            })
+
+        # 处理卖出意向
+        for d_idx, c_idx in zip(exit_dates, exit_cols):
+            date = common_index[d_idx]
+            code = common_columns[c_idx]
+            price = price_df.iloc[d_idx, c_idx]
+            status = "Success"
+            reason = ""
+            size = 0
+            pnl = 0
+            pnl_pct = 0
+            
+            if is_limit_down.iloc[d_idx, c_idx]:
+                status = "Failed"
+                reason = "Limit Down (Blocked)"
+            else:
+                match = trades_df[(trades_df['col'] == c_idx) & (trades_df['exit_idx'] == d_idx)]
+                if not match.empty:
+                    size = match.iloc[0]['size']
+                    pnl = match.iloc[0]['pnl']
+                    pnl_pct = match.iloc[0]['return'] * 100 
+                else:
+                    status = "Ignored"
+                    reason = "No Position to Sell"
+            
+            unified_records.append({
+                'Timestamp': date, 'Code': code, 'Action': 'SELL',
+                'Price': round(price, 3), 'Status': status, 'Reason': reason,
+                'Size': size, 'PnL': round(pnl, 2), 'PnL_Pct': round(pnl_pct, 2)
+            })
+
+        unified_df = pd.DataFrame(unified_records)
+        if not unified_df.empty:
+            unified_df = unified_df.sort_values(['Timestamp', 'Code']).reset_index(drop=True)
+            unified_df.to_csv('data/vbt_unified_trade_log.csv', index=False)
+            print(f"[OK] 统一交易日志已生成: data/vbt_unified_trade_log.csv (共 {len(unified_df)} 条记录)")
+        else:
+            print("[Warning] 未产生任何交易信号或记录。")
+
         stats = portfolio.stats()
         print("\n" + "="*50)
         print("Vectorbt 全市场动量策略统计报告")
         print("-" * 50)
-        # 兼容不同版本的 Key 名称
         def get_stat(keys):
             for k in keys:
                 if k in stats: return stats[k]
@@ -115,10 +220,6 @@ class VBTBacktester:
 if __name__ == "__main__":
     try:
         tester = VBTBacktester()
-        # 运行回测：每日持有动量最强的 30 只股票
-        portfolio = tester.run_momentum_screening(top_n=30)
-        
-        # 提示：如果需要绘图，可以调用 portfolio.plot()
-        # 注意在 CLI 环境下可能需要导出图片：portfolio.plot().write_image("vbt_result.png")
+        portfolio = tester.run_momentum_screening(top_n=20)
     except Exception as e:
-        print(f"❌ 回测运行失败: {e}")
+        print(f"[Error] 回测运行失败: {e}")

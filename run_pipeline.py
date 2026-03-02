@@ -11,38 +11,38 @@ REDIS_EXE = os.path.join(BASE_DIR, "Redis-x64-5.0.14.1", "redis-server.exe")
 REDIS_CONF = os.path.join(BASE_DIR, "Redis-x64-5.0.14.1", "redis.windows.conf")
 QUESTDB_EXE = os.path.join(BASE_DIR, "questdb", "questdb-9.3.3-rt-windows-x86-64", "bin", "questdb.exe")
 
-def is_port_open(port):
+def check_port(port):
     """检测本地端口是否已被占用"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('localhost', port)) == 0
 
-def start_service(name, port, command):
+def start_service(name, port, command, cwd=None):
     """启动后台服务"""
-    if is_port_open(port):
-        print(f"✅ {name} 已经在运行 (端口: {port})")
+    if check_port(port):
+        print(f"[OK] {name} 已经在运行 (端口: {port})")
     else:
-        print(f"🚀 正在启动 {name}...")
+        print(f"[Start] 正在启动 {name}...")
         try:
-            # 使用 creationflags 确保在 Windows 上静默运行
-            subprocess.Popen(command, creationflags=0x08000000) # CREATE_NO_WINDOW
+            subprocess.Popen(command, shell=True, cwd=cwd, 
+                             creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0)
             # 等待服务初始化
             for _ in range(10):
-                time.sleep(2)
-                if is_port_open(port):
-                    print(f"✅ {name} 启动成功")
+                time.sleep(1)
+                if check_port(port):
+                    print(f"[OK] {name} 启动成功")
                     return
-            print(f"❌ {name} 启动超时，请检查路径或日志。")
+            print(f"[Error] {name} 启动超时，请检查路径或日志。")
         except Exception as e:
-            print(f"❌ 无法启动 {name}: {e}")
+            print(f"[Error] 无法启动 {name}: {e}")
 
 def run_script(script_name):
     """执行 Python 脚本"""
     print(f"\n>>> 正在执行: {script_name}")
     try:
-        subprocess.check_call([PYTHON_EXE, script_name], cwd=BASE_DIR)
-        print(f"✨ {script_name} 执行完毕")
+        subprocess.run([PYTHON_EXE, script_name], check=True)
+        print(f"[Done] {script_name} 执行完毕")
     except subprocess.CalledProcessError:
-        print(f"❌ {script_name} 执行失败，流程中断。")
+        print(f"[Error] {script_name} 执行失败，流程中断。")
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -51,8 +51,8 @@ if __name__ == "__main__":
     print("="*50)
 
     # 1. 启动基础设施服务
-    start_service("Redis", 6379, [REDIS_EXE, REDIS_CONF])
-    start_service("QuestDB", 8812, [QUESTDB_EXE])
+    start_service("Redis", 6379, f'"{REDIS_EXE}" "{REDIS_CONF}"')
+    start_service("QuestDB", 8812, f'"{QUESTDB_EXE}"')
 
     # 2. 执行量化流水线
     pipeline = [
@@ -65,5 +65,5 @@ if __name__ == "__main__":
         run_script(script)
 
     print("\n" + "="*50)
-    print("🎉 所有评估与回测步骤已圆满完成！")
+    print("[Complete] 所有评估与回测步骤已圆满完成！")
     print("="*50)
