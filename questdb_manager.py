@@ -81,7 +81,7 @@ class QuestDBManager:
             res = cur.fetchone()
             return res[0] if res and res[0] else None
 
-    def sync_parquet_to_questdb(self, data_dir="D:/MyCode/QuantStock/data"):
+    def sync_parquet_to_questdb(self, data_dir="data"):
         """
         将本地 Parquet 数据湖同步至 QuestDB。
         采用增量同步机制：只读取比 QuestDB 中更新的记录。

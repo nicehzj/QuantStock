@@ -5,11 +5,11 @@ import os
 import sys
 
 # ================= 配置路径 =================
-BASE_DIR = r"D:\MyCode\QuantStock"
-PYTHON_EXE = os.path.join(BASE_DIR, r"quant_stock_env\Scripts\python.exe")
-REDIS_EXE = os.path.join(BASE_DIR, r"Redis-x64-5.0.14.1\redis-server.exe")
-REDIS_CONF = os.path.join(BASE_DIR, r"Redis-x64-5.0.14.1\redis.windows.conf")
-QUESTDB_EXE = os.path.join(BASE_DIR, r"questdb\questdb-9.3.3-rt-windows-x86-64\bin\questdb.exe")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PYTHON_EXE = os.path.join(BASE_DIR, "quant_stock_env", "Scripts", "python.exe")
+REDIS_EXE = os.path.join(BASE_DIR, "Redis-x64-5.0.14.1", "redis-server.exe")
+REDIS_CONF = os.path.join(BASE_DIR, "Redis-x64-5.0.14.1", "redis.windows.conf")
+QUESTDB_EXE = os.path.join(BASE_DIR, "questdb", "questdb-9.3.3-rt-windows-x86-64", "bin", "questdb.exe")
 
 def is_port_open(port):
     """检测本地端口是否已被占用"""

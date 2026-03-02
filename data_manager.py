@@ -74,7 +74,7 @@ def sync_worker(task_info):
     return code, max_date
 
 class BaostockDataManager:
-    def __init__(self, base_path="D:/MyCode/QuantStock/data"):
+    def __init__(self, base_path="data"):
         self.base_path = base_path
         self.stock_path = os.path.join(base_path, "daily_k")
         self.index_path = os.path.join(base_path, "index_k")

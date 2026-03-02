@@ -154,8 +154,8 @@ def run_full_market_backtest(signal_file='data/historical_signals.csv', start_da
     # 注册 bounds 表供 SQL 使用
     db.register('bounds', stock_bounds)
     
-    parquet_glob = "D:/MyCode/QuantStock/data/daily_k/*.parquet"
-    idx_path = "D:/MyCode/QuantStock/data/index_k/sh.000001.parquet"
+    parquet_glob = "data/daily_k/*.parquet"
+    idx_path = "data/index_k/sh.000001.parquet"
     
     # 加载基准指数 (完整时间轴)
     idx_df = db.execute(f"SELECT CAST(date AS TIMESTAMP) as date, open, high, low, close, volume, preclose FROM read_parquet('{idx_path}') WHERE date >= '{start_date}'").df()

@@ -23,7 +23,7 @@ class FactorEngine:
         self.db = duckdb.connect(database=':memory:')
         
         # 本地 Parquet 路径配置
-        self.data_path = "D:/MyCode/QuantStock/data/daily_k"
+        self.data_path = "data/daily_k"
         self.parquet_glob = os.path.join(self.data_path, "*.parquet")
 
     def _prepare_data_source(self):
