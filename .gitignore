@@ -34,11 +34,11 @@ qdbroot/
 dump.rdb
 
 # Data (Large files)
-data/daily_k/
-data/index_k/
-data/stock_pools/
-data/sync_metadata.json
-data/*.csv
+# data/daily_k/
+# data/index_k/
+# data/stock_pools/
+# data/sync_metadata.json
+data/
 
 # IDEs
 .vscode/

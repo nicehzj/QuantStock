@@ -58,7 +58,7 @@ if __name__ == "__main__":
     pipeline = [
         "alpha_evaluator.py",
         "vectorbt_backtest.py",
-        "backtrader_backtest.py"
+        # "backtrader_backtest.py"
     ]
 
     for script in pipeline:
