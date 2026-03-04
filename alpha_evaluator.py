@@ -94,7 +94,7 @@ class AlphaEvaluator:
             r.expire(scores_key, 86400 * 30)
             print(f"[OK] 已将 {ldate} 的 {len(codes)} 条交易信号推送到 Redis。")
 
-    def export_historical_signals(self, factor_name='factor_mom_20', top_n=20, start_date='2021-01-01', filename='data/historical_signals.csv', ascending=True):
+    def export_historical_signals(self, factor_name='factor_mom_20', top_n=20, start_date='2021-01-01', filename='data/historical_signals.csv', ascending=False):
         factors_df = self.engine.calculate_basic_factors()
         factors_df['date'] = pd.to_datetime(factors_df['date'])
         oos_factors = factors_df[factors_df['date'] >= start_date].copy()
