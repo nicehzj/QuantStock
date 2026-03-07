@@ -144,8 +144,10 @@ class VectorizedOptimizer:
         with open(f'data/oos_report_{factor_name}.md', 'w', encoding='utf-8') as f:
             f.write(f"# 因子盲测体检报告: {factor_name}\n\n")
             f.write(f"## 最优参数配置\n- 计算窗口 (W): {best_row['w']}\n- 价格基准 (P): {best_row['p']}\n- 调仓频率 (F): {best_row['f']}\n- 方向 (D): {best_row['rev']}\n\n")
-            f.write("## 核心回测指标 (2024-2026)\n")
-            f.write(oos_stats.to_markdown())
+            f.write("## 核心回测指标 (2024-2026)\n\n")
+            f.write("| 指标 | 数值 |\n| :--- | :--- |\n")
+            for idx, val in oos_stats.items():
+                f.write(f"| {idx} | {val} |\n")
         print(f"\n[OK] 盲测详细指标已导出至: data/oos_report_{factor_name}.md/.csv")
         
         plt.figure(figsize=(12,6))
