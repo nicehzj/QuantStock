@@ -35,6 +35,7 @@ class FactorEngine:
                 LAST_VALUE(r.open IGNORE NULLS) OVER (PARTITION BY s.code ORDER BY s.date) as open,
                 LAST_VALUE(r.amount IGNORE NULLS) OVER (PARTITION BY s.code ORDER BY s.date) as amount,
                 COALESCE(r.volume, 0) as volume,
+                LAG(r.close) OVER (PARTITION BY s.code ORDER BY s.date) as pre_close,
                 idx.idx_ret
             FROM skeleton s
             LEFT JOIN raw_data r ON s.date = r.date AND s.code = r.code
