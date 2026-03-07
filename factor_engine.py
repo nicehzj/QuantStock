@@ -52,8 +52,9 @@ class FactorEngine:
         t0 = time.time()
         
         # 预计算通用指标：ret, vwap
+        # 使用 CREATE OR REPLACE TABLE 确保 table 物理存在且包含最新列
         self.db.execute("""
-            CREATE OR REPLACE TABLE pre_metrics AS 
+            CREATE OR REPLACE TABLE pre_metrics_base AS 
             SELECT *, 
                    (close / NULLIF(LAG(close) OVER(PARTITION BY code ORDER BY date), 0) - 1) as ret,
                    (amount / NULLIF(volume, 0)) as vwap
@@ -64,10 +65,7 @@ class FactorEngine:
         win_sqls = []
         for w in windows:
             w_p = w - 1
-            # 这里的计算逻辑根据因子名自适应
             if factor_name == 'smart_money_proxy':
-                # Smart Money 对 Window 的依赖主要在于平滑，其基础计算是日内的
-                # 我们可以直接计算日内值，平滑放到 Python 做
                 win_sqls.append(f"((amount/NULLIF(volume,0))/NULLIF(close,0)) as sm_{w}")
             elif factor_name == 'amihud_illiq':
                 win_sqls.append(f"AVG((ABS(ret)/NULLIF(amount+1e-9, 0))*1e9) OVER (PARTITION BY code ORDER BY date ROWS BETWEEN {w_p} PRECEDING AND CURRENT ROW) as illiq_{w}")
@@ -76,7 +74,46 @@ class FactorEngine:
             elif factor_name == 'ivol':
                 win_sqls.append(f"STDDEV_POP(ret - idx_ret) OVER (PARTITION BY code ORDER BY date ROWS BETWEEN {w_p} PRECEDING AND CURRENT ROW) as ivol_{w}")
 
-        sql = f"SELECT date, code, open, close, vwap, {', '.join(win_sqls)} FROM pre_metrics WHERE date >= '{start_date}'"
-        df = self.db.execute(sql).df()
+        sql = f"CREATE OR REPLACE TABLE pre_metrics AS SELECT *, {', '.join(win_sqls)} FROM pre_metrics_base"
+        self.db.execute(sql)
+        
+        res_df = self.db.execute(f"SELECT date, code, open, close, vwap, {', '.join(win_sqls)} FROM pre_metrics WHERE date >= '{start_date}'").df()
         print(f"[OK] 变体批量计算完成。耗时: {time.time()-t0:.2f}s")
+        return res_df
+
+    def get_pivoted_factor(self, factor_col, start_date='2006-01-01', factor_name=None, windows=None, fill_na=True):
+        """
+        利用 DuckDB 强大的 PIVOT 功能，直接在数据库层完成长表转宽表
+        """
+        self._initialize_base_data()
+        
+        if factor_name and windows:
+             self.calculate_all_variants(factor_name, windows, start_date=start_date)
+        elif not self.db.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'pre_metrics'").fetchone()[0]:
+             self.calculate_all_variants('smart_money_proxy', [10], start_date=start_date)
+             
+        t0 = time.time()
+        sql = f"""
+            PIVOT (SELECT date, code, {factor_col} FROM pre_metrics WHERE date >= '{start_date}')
+            ON code
+            USING FIRST({factor_col})
+            GROUP BY date
+            ORDER BY date
+        """
+        df = self.db.execute(sql).df().set_index('date')
+        
+        # 价格需要填充，但因子不建议填充（代表停牌）
+        if fill_na:
+            df = df.ffill()
+            
+        print(f"[OK] 字段 {factor_col} PIVOT 完成 (fill_na={fill_na})。耗时: {time.time()-t0:.2f}s")
         return df
+
+    def get_benchmark_prices(self, start_date='2006-01-01'):
+        """
+        获取基准指数 (沪深300) 的价格序列
+        """
+        self._initialize_base_data()
+        df = self.db.execute(f"SELECT date, idx_close FROM idx_data WHERE date >= '{start_date}' ORDER BY date").df()
+        df['date'] = pd.to_datetime(df['date'])
+        return df.set_index('date')['idx_close']
