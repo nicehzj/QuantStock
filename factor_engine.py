@@ -67,7 +67,8 @@ class FactorEngine:
         for w in windows:
             w_p = w - 1
             if factor_name == 'smart_money_proxy':
-                win_sqls.append(f"((amount/NULLIF(volume,0))/NULLIF(close,0)) as sm_{w}")
+                # 修改为：窗口期内 (VWAP / Close) 的移动平均
+                win_sqls.append(f"AVG((amount/NULLIF(volume,0))/NULLIF(close,0)) OVER (PARTITION BY code ORDER BY date ROWS BETWEEN {w_p} PRECEDING AND CURRENT ROW) as sm_{w}")
             elif factor_name == 'amihud_illiq':
                 win_sqls.append(f"AVG((ABS(ret)/NULLIF(amount+1e-9, 0))*1e9) OVER (PARTITION BY code ORDER BY date ROWS BETWEEN {w_p} PRECEDING AND CURRENT ROW) as illiq_{w}")
             elif factor_name == 'skew':

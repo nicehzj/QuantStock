@@ -9,73 +9,121 @@ from tqdm import tqdm
 import gc
 import argparse
 import time
+from numba import njit
+from pathlib import Path
 
-class VectorizedOptimizer:
+# 设置绘图风格 (解决中文乱码)
+plt.rcParams['font.sans-serif'] = ['SimHei'] 
+plt.rcParams['axes.unicode_minus'] = False
+
+# =====================================================================
+# ✨ 核心引擎: Numba 加速的 A 股实盘交易约束
+# =====================================================================
+@njit
+def fix_weights_ashare(ideal_w, is_limit_up, is_limit_down, is_suspended, force_liquidate):
+    """路径依赖的 A 股权重修正器"""
+    actual_w = np.zeros_like(ideal_w)
+    for c in range(ideal_w.shape[1]):
+        if not (is_suspended[0, c] or force_liquidate[0, c]):
+            actual_w[0, c] = ideal_w[0, c]
+            
+    for t in range(1, ideal_w.shape[0]):
+        for c in range(ideal_w.shape[1]):
+            target = ideal_w[t, c]
+            prev = actual_w[t-1, c]
+            if force_liquidate[t, c]:
+                actual_w[t, c] = 0.0
+            elif is_suspended[t, c]:
+                actual_w[t, c] = prev
+            elif is_limit_up[t, c] and target > prev:
+                actual_w[t, c] = prev
+            elif is_limit_down[t, c] and target < prev:
+                actual_w[t, c] = prev
+            else:
+                actual_w[t, c] = target
+    return actual_w
+
+
+class PerformanceAnalyzer:
+    @staticmethod
+    def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.03):
+        """计算回测核心指标 (带防崩保护)"""
+        if returns.empty or returns.std() == 0:
+            return {
+                'TotalReturn': 0.0, 'AnnReturn': 0.0, 'MaxDD': 0.0,
+                'Sharpe': -9.0, 'Calmar': 0.0, 'Vol': 0.0,
+                'WinRate': 0.0, 'PLRatio': 0.0
+            }
+            
+        cum_returns = (1 + returns).cumprod()
+        total_return = cum_returns.iloc[-1] - 1
+        years = len(returns) / 252
+        ann_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+        running_max = cum_returns.expanding().max()
+        max_dd_val = ((cum_returns - running_max) / (running_max + 1e-9)).min()
+        vol = returns.std() * np.sqrt(252)
+        sharpe = (ann_return - risk_free_rate) / (vol + 1e-9)
+        calmar = ann_return / (abs(max_dd_val) + 1e-9)
+        win_rate = (returns > 0).sum() / len(returns)
+        pos_rets = returns[returns > 0]; neg_rets = returns[returns < 0]
+        profit_loss_ratio = pos_rets.mean() / (abs(neg_rets.mean()) + 1e-9) if not neg_rets.empty else 0
+
+        return {
+            'TotalReturn': total_return, 'AnnReturn': ann_return, 'MaxDD': max_dd_val,
+            'Sharpe': sharpe, 'Calmar': calmar, 'Vol': vol,
+            'WinRate': win_rate, 'PLRatio': profit_loss_ratio
+        }
+
+
+class AshareVectorizedOptimizer:
     def __init__(self):
         self.engine = FactorEngine()
         
-    def get_all_factor_variants_fast(self, factor_name, windows, price_fields):
-        # 1. 计算所有变体长表
+    def _clean_and_prepare_data(self, price_df, volume_df, preclose_df):
+        limit_ratios = pd.Series(0.099, index=price_df.columns)
+        limit_ratios[price_df.columns.str.startswith('sz.30') | price_df.columns.str.startswith('sh.688')] = 0.199
+        is_limit_up = price_df >= (preclose_df * (1 + limit_ratios) - 0.002)
+        is_limit_down = price_df <= (preclose_df * (1 - limit_ratios) + 0.002)
+        is_suspended = volume_df <= 0
+        force_liquidate = price_df.isna() & preclose_df.isna()
+        valid_price = price_df.ffill().bfill().clip(lower=0.001).fillna(0.001)
+        valid_preclose = preclose_df.ffill().bfill().clip(lower=0.001).fillna(0.001)
+        return valid_price, valid_preclose, is_limit_up.values, is_limit_down.values, is_suspended.values, force_liquidate.values
+
+    def run_fast_optimize(self, factor_name, mode='smoke'):
+        # 1. 准备参数空间
+        if mode == 'smoke':
+            windows = [10, 20]; price_fields = ['open']; freqs = ['5D']
+        else:
+            windows = [5, 10, 20, 40, 60]; price_fields = ['open', 'vwap']; freqs = ['1D', '5D', '10D']
+
+        # 2. 加载基础数据并【统一转换为 DatetimeIndex】(关键修复点)
         big_df_sample = self.engine.calculate_all_variants(factor_name, windows)
-        
-        # 2. 针对每个 window，获取因子宽表
         variants = {}
         for w in windows:
             base_col = [c for c in big_df_sample.columns if f"_{w}" in c][0]
             pivot = self.engine.get_pivoted_factor(base_col, factor_name=factor_name, windows=windows, fill_na=False)
             pivot.index = pd.to_datetime(pivot.index)
-            # MAD 去极值
-            m = pivot.median(axis=1)
-            mad = (pivot.sub(m, axis=0)).abs().median(axis=1)
-            pivot = pivot.clip(m - 4.4478*mad, m + 4.4478*mad, axis=0)
-            variants[w] = pivot.astype(np.float32)
+            m = pivot.median(axis=1); mad = (pivot.sub(m, axis=0)).abs().median(axis=1)
+            variants[w] = pivot.clip(m - 4.4478*mad, m + 4.4478*mad, axis=0).astype(np.float32)
             
-        # 3. 预取价格宽表并执行【数值净化】
-        prices = {}
+        prices_dict = {}
         for pf in price_fields:
-            df_p = self.engine.get_pivoted_factor(pf, fill_na=True).ffill().bfill()
-            # 关键修复：确保所有执行价格 > 0 且有限，防止 Numba 崩溃
-            df_p = df_p.clip(lower=0.001).fillna(0.001)
+            df_p = self.engine.get_pivoted_factor(pf, fill_na=True)
             df_p.index = pd.to_datetime(df_p.index)
-            prices[pf] = df_p.astype(np.float32)
+            prices_dict[pf] = df_p
             
-        volume = self.engine.get_pivoted_factor('volume', fill_na=False).fillna(0).astype(np.float32)
+        volume = self.engine.get_pivoted_factor('volume', fill_na=False).fillna(0)
         volume.index = pd.to_datetime(volume.index)
         
-        pre_close = self.engine.get_pivoted_factor('pre_close', fill_na=True).ffill().bfill()
-        pre_close = pre_close.clip(lower=0.001).fillna(0.001) # 同步净化
+        pre_close = self.engine.get_pivoted_factor('pre_close', fill_na=True)
         pre_close.index = pd.to_datetime(pre_close.index)
-            
-        return variants, prices, volume, pre_close.astype(np.float32)
 
-    def run_fast_optimize(self, factor_name, mode='smoke', batch_size=5):
-        if mode == 'smoke':
-            print(f"\n>>> 启动【快速冒烟测试】网格搜索: {factor_name}")
-            windows = [10, 20]
-            price_fields = ['close']
-            freqs = ['5D']
-        else:
-            print(f"\n>>> 启动【全维度向量化】高性能网格搜索: {factor_name}")
-            windows = [5, 10, 20, 40]
-            price_fields = ['close', 'vwap']
-            freqs = ['1D', '5D', '10D', '20D']
+        # 3. 创建目录
+        output_dir = Path(f"data/opt_{factor_name}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n>>> 深度寻优启动！结果归档至: {output_dir}")
 
-        variants, prices, volume, pre_close = self.get_all_factor_variants_fast(factor_name, windows, price_fields)
-        
-        # 预计算流动性掩码
-        is_tradable = (volume > 0).astype(bool)
-        price_base = prices['close'] 
-        ret_daily = (price_base / pre_close - 1).fillna(0)
-        can_trade = is_tradable & (ret_daily < 0.098) & (ret_daily > -0.098)
-        
-        top_n = 20
-        signal_bank = {}
-        print(">>> 正在预计算截面排名信号...")
-        for w, f_pivot in variants.items():
-            for d in [True, False]: 
-                rank_mat = f_pivot.rank(axis=1, ascending=d, method='first')
-                signal_bank[(w, d)] = (rank_mat <= top_n).astype(np.float32) * (0.95/top_n)
-        
         all_params = []
         for w in windows:
             for pf in price_fields:
@@ -83,162 +131,146 @@ class VectorizedOptimizer:
                     for d in [True, False]:
                         all_params.append({'w':w, 'p':pf, 'f':freq, 'd':d})
 
-        all_results = []
-        num_batches = (len(all_params) + batch_size - 1) // batch_size
-        
-        for b in range(num_batches):
-            batch_params = all_params[b*batch_size : (b+1)*batch_size]
-            print(f">>> 批次 {b+1}/{num_batches} (执行中...)")
+        master_results = []
+        for i, p in enumerate(all_params):
+            p_name = f"W{p['w']}_P{p['p']}_F{p['f']}_D{p['d']}"
+            print(f"[{i+1}/{len(all_params)}] 正在评估组合并生成分析图: {p_name}")
             
-            batch_weights = []; keys = []
-            for p in batch_params:
-                base_sig = signal_bank[(p['w'], p['d'])]
-                step = int(p['f'].replace('D',''))
-                rebalance_days = base_sig.index[::step]
-                final_w = base_sig.reindex(base_sig.index).loc[rebalance_days].reindex(base_sig.index).ffill().shift(1).fillna(0.0)
-                batch_weights.append(final_w.astype(np.float32))
-                keys.append((p['w'], p['p'], p['f'], p['d']))
+            f_pivot = variants[p['w']]
+            o_p = prices_dict[p['p']]
             
-            mega_w = pd.concat(batch_weights, axis=1, keys=keys, names=['w', 'p', 'f', 'rev'])
-            # 流动性锁死：不可交易日权重设为 NaN 跳过订单
-            mega_w = mega_w.where(can_trade, np.nan)
-            
-            o_p = prices[batch_params[0]['p']]
-            portfolio = vbt.Portfolio.from_orders(
-                o_p, size=mega_w, size_type='targetpercent', 
-                init_cash=1000000, fees=0.0015, freq='1D', 
-                group_by=['w', 'p', 'f', 'rev'], cash_sharing=True
+            # 执行深度评估 (历史滚动 + 诊断图)
+            rolling_df, final_metrics = self.run_deep_evaluation(
+                factor_name, f_pivot, o_p, volume, pre_close, p, p_name, output_dir
             )
             
-            batch_stats = pd.DataFrame({
-                'Return': portfolio.total_return() * 100,
-                'Sharpe': portfolio.sharpe_ratio(),
-                'Calmar': portfolio.calmar_ratio(),
-                'MaxDD': portfolio.max_drawdown() * 100
-            }).reset_index()
-            all_results.append(batch_stats)
-            del portfolio, mega_w; gc.collect()
+            master_results.append({**p, **final_metrics})
+            gc.collect()
 
-        stats_df = pd.concat(all_results).reset_index(drop=True)
-        stats_df.columns = ['w', 'p', 'f', 'rev', 'Return', 'Sharpe', 'Calmar', 'MaxDD']
+        # 5. 保存排行榜
+        master_df = pd.DataFrame(master_results).sort_values('Sharpe', ascending=False)
+        master_df.to_csv(output_dir / "master_leaderboard.csv", index=False)
         
-        best_row = stats_df.loc[stats_df['Sharpe'].idxmax()]
-        print(f"\n[OK] 锁定最优配置: W:{best_row['w']} P:{best_row['p']} F:{best_row['f']} D:{best_row['rev']} Sharpe:{best_row['Sharpe']:.4f}")
-
-        # OOS 盲测
-        print(f"\n>>> 启动【2024-2026】盲测考场...")
-        test_period = '2024-01-01'
-        final_res = self.rigorous_backtest_single(
-            variants[best_row['w']].loc[test_period:], 
-            prices[best_row['p']].loc[test_period:], 
-            volume.loc[test_period:], 
-            pre_close.loc[test_period:], 
-            freq=best_row['f'], ascending=best_row['rev']
-        )
-        print("\n" + "*"*60 + "\n因子终极盲测报告 (2024-2026)\n" + "*"*60)
-        oos_stats = final_res.stats()
-        print(oos_stats)
+        best = master_df.iloc[0]
+        print(f"\n[OK] 寻优完成。冠军组合: W:{best['w']} P:{best['p']} F:{best['f']} D:{best['d']} Sharpe:{best['Sharpe']:.4f}")
         
-        # 导出 OOS 报告
-        oos_stats.to_csv(f'data/oos_report_{factor_name}.csv')
-        with open(f'data/oos_report_{factor_name}.md', 'w', encoding='utf-8') as f:
-            f.write(f"# 因子盲测体检报告: {factor_name}\n\n")
-            f.write(f"## 最优参数配置\n- 计算窗口 (W): {best_row['w']}\n- 价格基准 (P): {best_row['p']}\n- 调仓频率 (F): {best_row['f']}\n- 方向 (D): {best_row['rev']}\n\n")
-            f.write("## 核心回测指标 (2024-2026)\n\n")
-            f.write("| 指标 | 数值 |\n| :--- | :--- |\n")
-            for idx, val in oos_stats.items():
-                f.write(f"| {idx} | {val} |\n")
-        print(f"\n[OK] 盲测详细指标已导出至: data/oos_report_{factor_name}.md/.csv")
+        # 6. 执行冠军 OOS 盲测
+        self.run_final_oos_best(factor_name, variants[best['w']], prices_dict[best['p']], volume, pre_close, best, output_dir)
+
+    def run_deep_evaluation(self, factor_name, f_pivot, o_price, volume, pre_close, p, p_name, output_dir):
+        # 1. 全样本严谨回测
+        _, final_metrics = self.rigorous_backtest_single(f_pivot, o_price, volume, pre_close, freq=p['f'], ascending=p['d'])
         
-        plt.figure(figsize=(12,6))
-        final_res.value().plot(label=f'Strategy (W:{best_row["w"]})', color='red', lw=2)
-        benchmark_p = self.engine.get_benchmark_prices(start_date=test_period)
-        if not benchmark_p.empty:
-            benchmark_normalized = (benchmark_p / benchmark_p.iloc[0]) * final_res.value().iloc[0]
-            benchmark_normalized.plot(label='Benchmark (HS300)', color='black', alpha=0.5, linestyle='--')
-        plt.title(f'Final OOS Test with Liquidity Lock: {factor_name}')
-        plt.legend(); plt.grid(True, alpha=0.3)
-        plt.savefig(f'data/final_oos_{factor_name}.png')
-
-        self.run_historical_rolling_test(factor_name, variants[best_row['w']], prices[best_row['p']], volume, pre_close, best_row)
-        return stats_df
-
-    def run_historical_rolling_test(self, factor_name, f_pivot, o_p, volume, pre_close, best_params):
-        print(f"\n" + "="*60 + "\n正在进入 2006-2023 历史压力测试 (集成流动性过滤)...\n" + "="*60)
-        windows = []
-        for y in range(2006, 2022):
-            windows.append((f"{y}-01-01", f"{y+2}-12-31"))
+        # 2. 历史滚动测试
+        windows_dates = []
+        for y in range(2006, 2023): windows_dates.append((f"{y}-01-01", f"{y+2}-12-31"))
             
         rolling_results = []
-        for start, end in tqdm(windows, desc="滚动窗口扫描"):
+        for start, end in windows_dates:
             try:
-                slice_f = f_pivot.loc[start:end]
-                slice_p = o_p.loc[start:end]
-                slice_v = volume.loc[start:end]
-                slice_pre = pre_close.loc[start:end]
+                slice_f = f_pivot.loc[start:end]; slice_p = o_price.loc[start:end]
+                slice_v = volume.loc[start:end]; slice_pre = pre_close.loc[start:end]
                 if len(slice_f) < 100: continue
                 
-                res = self.rigorous_backtest_single(slice_f, slice_p, slice_v, slice_pre, freq=best_params['f'], ascending=best_params['rev'])
-                s = res.stats()
-                trades_rec = res.trades.records_readable
-                avg_trade_ret = trades_rec['Return'].mean() * 100 if not trades_rec.empty else 0
+                res, m = self.rigorous_backtest_single(slice_f, slice_p, slice_v, slice_pre, freq=p['f'], ascending=p['d'])
                 
-                years = len(slice_f) / 252
-                order_records = res.orders.records_readable
-                total_trade_volume = (order_records['Size'].abs() * order_records['Price']).sum() if not order_records.empty else 0
-                avg_portfolio_value = res.value().mean().mean()
-                ann_turnover = (total_trade_volume / 2) / avg_portfolio_value / years if (years > 0 and avg_portfolio_value > 0) else 0
-                
-                rolling_results.append({
-                    'Window': f"{start[:4]}-{end[:4]}",
-                    'Return': s.get('Total Return [%]', 0),
-                    'Sharpe': s.get('Sharpe Ratio', 0),
-                    'Calmar': s.get('Calmar Ratio', 0),
-                    'MaxDD': s.get('Max Drawdown [%]', 0),
-                    'WinRate': s.get('Win Rate [%]', 0),
-                    'ProfitFactor': s.get('Profit Factor', 0),
-                    'Turnover': ann_turnover,
-                    'AvgTradeRet': avg_trade_ret
-                })
+                years = len(slice_f) / 252; records = res.orders.records_readable
+                trade_vol = (records['Size'].abs() * records['Price']).sum() if not records.empty else 0
+                avg_val = res.value().mean()
+                turnover = (trade_vol / 2) / (avg_val + 1e-9) / years
+                rolling_results.append({'Window': f"{start[:4]}-{end[:4]}", 'Turnover': turnover, **m})
             except Exception: continue
-
+            
         rolling_df = pd.DataFrame(rolling_results)
-        if rolling_df.empty: return
-        print("\n" + "*"*60 + "\n历史滚动“体检”核心指标汇总 (2006-2023)\n" + "*"*60)
-        print(rolling_df.to_string(index=False))
-        
-        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        plt.subplots_adjust(hspace=0.35)
-        axes[0,0].bar(rolling_df['Window'], rolling_df['Sharpe'], color='skyblue', label='Sharpe')
-        axes[0,0].plot(rolling_df['Window'], rolling_df['Calmar'], marker='o', color='gold', label='Calmar')
-        axes[0,0].set_title('Consistency: Sharpe & Calmar'); axes[0,0].legend(); axes[0,0].tick_params(axis='x', rotation=45)
-        axes[0,1].plot(rolling_df['Window'], rolling_df['WinRate'], marker='o', color='forestgreen'); axes[0,1].set_title('Win Rate Trend'); axes[0,1].tick_params(axis='x', rotation=45)
-        axes[1,0].bar(rolling_df['Window'], rolling_df['MaxDD'], color='salmon'); axes[1,0].set_title('Max Drawdown (%)'); axes[1,0].invert_yaxis(); axes[1,0].tick_params(axis='x', rotation=45)
-        axes[1,1].bar(rolling_df['Window'], rolling_df['Turnover'], color='gray', alpha=0.6); axes[1,1].set_title('Annualized Turnover'); axes[1,1].tick_params(axis='x', rotation=45)
-        plt.savefig(f'data/rolling_diagnostic_{factor_name}.png')
-        rolling_df.to_csv(f'data/rolling_diagnostic_{factor_name}.csv', index=False, encoding='utf-8-sig')
+        if not rolling_df.empty:
+            rolling_df.to_csv(output_dir / f"rolling_{p_name}.csv", index=False)
+            # 绘图逻辑
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10)); plt.subplots_adjust(hspace=0.35)
+            axes[0,0].bar(rolling_df['Window'], rolling_df['Sharpe'], color='skyblue', label='Sharpe')
+            axes[0,0].plot(rolling_df['Window'], rolling_df['Calmar'], marker='o', color='gold', label='Calmar')
+            axes[0,0].set_title(f'稳定性诊断: {p_name}'); axes[0,0].legend(); axes[0,0].tick_params(axis='x', rotation=45)
+            axes[0,1].plot(rolling_df['Window'], rolling_df['WinRate'], marker='o', color='forestgreen'); axes[0,1].set_title('胜率走势 (%)'); axes[0,1].tick_params(axis='x', rotation=45)
+            axes[1,0].bar(rolling_df['Window'], rolling_df['MaxDD'] * 100, color='salmon'); axes[1,0].set_title('各窗口最大回撤 (%)'); axes[1,0].invert_yaxis(); axes[1,0].tick_params(axis='x', rotation=45)
+            axes[1,1].bar(rolling_df['Window'], rolling_df['Turnover'], color='gray', alpha=0.6); axes[1,1].set_title('年化单边换手率'); axes[1,1].tick_params(axis='x', rotation=45)
+            plt.savefig(output_dir / f"diagnostic_{p_name}.png"); plt.close(fig)
+            
+        return rolling_df, final_metrics
 
-    def rigorous_backtest_single(self, f_pivot, o_p, volume, pre_close, top_n=20, freq='5D', ascending=True):
-        ideal_w = (f_pivot.rank(axis=1, ascending=ascending, method='first') <= top_n).astype(float) * (0.95 / top_n)
-        step = int(freq.replace('D',''))
-        rebalance_days = ideal_w.index[::step]
-        final_w = ideal_w.reindex(ideal_w.index).loc[rebalance_days].reindex(ideal_w.index).ffill().shift(1).fillna(0.0)
+    def run_final_oos_best(self, factor_name, f_pivot, o_price, volume, pre_close, best_p, output_dir):
+        """冠军 OOS 战报绘图"""
+        test_start = '2024-01-01'
+        print(f">>> 正在对冠军参数进行 OOS 终极盲测 (2024-至今)...")
+        slice_f = f_pivot.loc[test_start:]; slice_p = o_price.loc[test_start:]
+        slice_v = volume.loc[test_start:]; slice_pre = pre_close.loc[test_start:]
         
-        is_tradable = (volume > 0).astype(bool)
-        ret_daily = (o_p / pre_close - 1).fillna(0)
-        can_trade = is_tradable & (ret_daily < 0.098) & (ret_daily > -0.098)
+        portfolio, metrics = self.rigorous_backtest_single(slice_f, slice_p, slice_v, slice_pre, freq=best_p['f'], ascending=best_p['d'])
         
-        final_w = final_w.where(can_trade, np.nan)
-        # 数值净化：确保 VectorBT 获得的始终是正值价格矩阵
-        valid_p = o_p.ffill().bfill().clip(lower=0.001).fillna(0.001)
+        # 绘图
+        plt.figure(figsize=(12, 7))
+        strategy_equity = portfolio.value()
+        norm_equity = strategy_equity / strategy_equity.iloc[0]
+        norm_equity.plot(label='Strategy (Best)', color='red', lw=2)
         
-        return vbt.Portfolio.from_orders(valid_p, size=final_w, size_type='targetpercent', init_cash=1000000, fees=0.0015, freq='1D', cash_sharing=True)
+        benchmark_p = self.engine.get_benchmark_prices(start_date=test_start)
+        if not benchmark_p.empty:
+            common_idx = norm_equity.index.intersection(benchmark_p.index)
+            bench_norm = benchmark_p.loc[common_idx] / benchmark_p.loc[common_idx].iloc[0]
+            bench_norm.plot(label='Benchmark (HS300)', color='black', alpha=0.5, linestyle='--')
+            
+        plt.title(f'Final OOS Test (2024-Present): {factor_name}\nBest: W{best_p["w"]} P:{best_p["p"]} F:{best_p["f"]}')
+        plt.legend(); plt.grid(True, alpha=0.3); plt.savefig(output_dir / "final_oos_best_equity.png"); plt.close()
+        print(f"[OK] 冠军 OOS 战报已生成至: {output_dir}")
+
+    def rigorous_backtest_single(self, f_pivot, o_p, volume, pre_close, top_n=20, freq='5D', ascending=True, slippage=0.0005):
+        """核心回测引擎: 已统一日期索引类型"""
+        # 1. 严格对齐日期索引
+        common_idx = f_pivot.index.intersection(o_p.index).intersection(volume.index).intersection(pre_close.index)
+        if len(common_idx) < 10:
+            return None, PerformanceAnalyzer.empty_metrics()
+            
+        f_sub = f_pivot.loc[common_idx]; o_sub = o_p.loc[common_idx]
+        v_sub = volume.loc[common_idx]; pr_sub = pre_close.loc[common_idx]
+        
+        # 2. 准备约束
+        valid_p, valid_pre, l_up, l_down, susp, force_liq = self._clean_and_prepare_data(o_sub, v_sub, pr_sub)
+        
+        # 3. 信号与排名 (活跃度过滤)
+        active_factor = f_sub.where((v_sub > 0) & (f_sub != 0), np.nan)
+        ideal_w_raw = (active_factor.rank(axis=1, ascending=ascending, method='first') <= top_n).astype(float) * (0.95 / top_n)
+        
+        step = int(freq.replace('D','')); rebalance_days = ideal_w_raw.index[::step]
+        ideal_w = ideal_w_raw.reindex(ideal_w_raw.index).loc[rebalance_days].reindex(ideal_w_raw.index).ffill().shift(1).fillna(0.0)
+        
+        # 4. 执行状态机
+        actual_w_vals = fix_weights_ashare(ideal_w.values, l_up, l_down, susp, force_liq)
+        actual_w = pd.DataFrame(actual_w_vals, index=ideal_w.index, columns=ideal_w.columns)
+        
+        # 5. VectorBT 回测
+        base_rate = 0.0003
+        portfolio = vbt.Portfolio.from_orders(valid_p, size=actual_w, size_type='targetpercent', init_cash=1000000, fees=base_rate, slippage=slippage, freq='1D', cash_sharing=True)
+        
+        # 6. 精准成本扣除 (5元门槛费 + 印花税)
+        records = portfolio.orders.records_readable
+        if not records.empty:
+            date_col = 'Timestamp' if 'Timestamp' in records.columns else ('Index' if 'Index' in records.columns else 'Date')
+            sell_mask = records['Size'] < 0
+            records['StampDuty'] = records.loc[sell_mask, 'Size'].abs() * records.loc[sell_mask, 'Price'] * 0.001
+            records['MinSurcharge'] = (5.0 - records['Size'].abs() * records['Price'] * base_rate).clip(lower=0)
+            
+            costs = records.groupby(pd.to_datetime(records[date_col]).dt.date)[['StampDuty', 'MinSurcharge']].sum().sum(axis=1)
+            costs.index = pd.to_datetime(costs.index)
+            cumulative_cost = costs.reindex(portfolio.value().index).fillna(0).cumsum()
+            true_returns = (portfolio.value() - cumulative_cost).pct_change().fillna(0)
+        else:
+            true_returns = portfolio.returns().fillna(0)
+            
+        return portfolio, PerformanceAnalyzer.calculate_metrics(true_returns)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='QuantStock 因子高性能优化器')
+    parser = argparse.ArgumentParser(description='QuantStock 因子深度全景优化器')
     parser.add_argument('--factor', type=str, default='smart_money_proxy', help='因子名称')
     parser.add_argument('--mode', type=str, choices=['smoke', 'full'], default='smoke', help='运行模式: smoke(冒烟) 或 full(全量)')
     args = parser.parse_args()
     t_start = time.time()
-    VectorizedOptimizer().run_fast_optimize(args.factor, mode=args.mode)
-    print(f"\n============================================================\n任务完成！总耗时: {time.time() - t_start:.2f} 秒\n============================================================\n")
+    AshareVectorizedOptimizer().run_fast_optimize(args.factor, mode=args.mode)
+    print(f"\n任务完成！总耗时: {time.time() - t_start:.2f} 秒\n")
