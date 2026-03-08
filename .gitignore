@@ -52,3 +52,7 @@ Desktop.ini
 
 # data zip
 *.zip
+
+# folder
+EasyXT/
+EasyQuant/
